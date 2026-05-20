@@ -1,0 +1,6 @@
+**~**
+/.vs/
+/Bin/
+/Build/
+*.aps
+*.vcxproj.user
