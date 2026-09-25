@@ -67,9 +67,13 @@ protected:
 
   // Tray icon members.
   HWND m_tray_hwnd = NULL;
+  HWND m_last_shell_tray_hwnd = NULL;
   NOTIFYICONDATAW m_nid = {};
   HICON m_icon_normal = NULL;
   HICON m_icon_muted = NULL;
+  bool m_tray_icon_added = false;
+  UINT m_tray_check_count = 0;
+  static UINT s_msg_taskbar_created;
   static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
   bool m_cfg_allow_remote = false;
@@ -117,9 +121,11 @@ public:
   void FireRestart();
   void FireShutdown();
 
-  // Mute toggle.
+  // Mute toggle and state persistence.
   bool IsMuted() const { return m_is_muted; }
   void ToggleMute();
+  bool LoadMuteState() const;
+  void SaveMuteState() const;
 
   // Auto-start on boot.
   bool IsAutoStartEnabled() const;
@@ -129,6 +135,7 @@ public:
   bool InitTrayIcon(HINSTANCE hInstance);
   void RemoveTrayIcon();
   void UpdateTrayIcon();
+  void EnsureTrayIcon(bool forceReadd = false);
   HICON CreateSpeakerIcon(bool muted);
 
   void ParseStreamArgs(KeepStreamType stream_type, const char *args);

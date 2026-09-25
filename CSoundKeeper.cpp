@@ -439,11 +439,48 @@ void CSoundKeeper::FireShutdown()
   m_do_shutdown = true;
 }
 
-// Mute toggle.
+// Mute toggle and state persistence via HKCU\Software\SoundKeeper.
+
+static const wchar_t *kConfigKey = L"Software\\SoundKeeper";
+static const wchar_t *kMutedValue = L"IsMuted";
+
+bool CSoundKeeper::LoadMuteState() const
+{
+  HKEY hKey = NULL;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, kConfigKey, 0, KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+    return false;
+
+  DWORD val = 0;
+  DWORD cbData = sizeof(val);
+  DWORD type = 0;
+  bool muted = false;
+  if (RegQueryValueExW(hKey, kMutedValue, NULL, &type, (LPBYTE)&val, &cbData) == ERROR_SUCCESS && type == REG_DWORD)
+  {
+    muted = (val != 0);
+  }
+
+  RegCloseKey(hKey);
+  return muted;
+}
+
+void CSoundKeeper::SaveMuteState() const
+{
+  HKEY hKey = NULL;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, kConfigKey, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+  {
+    DebugLogError("SaveMuteState: failed to open or create config registry key.");
+    return;
+  }
+
+  DWORD val = m_is_muted ? 1 : 0;
+  RegSetValueExW(hKey, kMutedValue, 0, REG_DWORD, (const BYTE *)&val, sizeof(val));
+  RegCloseKey(hKey);
+}
 
 void CSoundKeeper::ToggleMute()
 {
   m_is_muted = !m_is_muted;
+  this->SaveMuteState();
   DebugLog("Mute toggled: %s.", m_is_muted ? "Muted" : "Unmuted");
 
   if (m_is_muted)
@@ -551,12 +588,31 @@ HICON CSoundKeeper::CreateSpeakerIcon(bool muted)
   return hIcon;
 }
 
+UINT CSoundKeeper::s_msg_taskbar_created = 0;
+
 LRESULT CALLBACK CSoundKeeper::TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
   CSoundKeeper *self = (CSoundKeeper *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 
+  if (s_msg_taskbar_created != 0 && msg == s_msg_taskbar_created)
+  {
+    if (self)
+    {
+      DebugLog("TaskbarCreated received. Re-adding tray icon.");
+      self->EnsureTrayIcon(true);
+    }
+    return 0;
+  }
+
   switch (msg)
   {
+  case WM_TIMER:
+    if (wParam == 1 && self)
+    {
+      self->EnsureTrayIcon(false);
+    }
+    return 0;
+
   case WM_TRAYICON:
     switch (LOWORD(lParam))
     {
@@ -577,8 +633,22 @@ LRESULT CALLBACK CSoundKeeper::TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
         AppendMenuW(hMenu, MF_STRING | (self->IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED), IDM_AUTOSTART, L"\u5F00\u673A\u81EA\u542F");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"\u9000\u51FA");
+
+        BOOL menuRightAligned = FALSE;
+        SystemParametersInfoW(SPI_GETMENUDROPALIGNMENT, 0, &menuRightAligned, 0);
+        if (menuRightAligned)
+        {
+          SystemParametersInfoW(SPI_SETMENUDROPALIGNMENT, FALSE, NULL, 0);
+        }
+
         SetForegroundWindow(hwnd);
-        TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+        TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+
+        if (menuRightAligned)
+        {
+          SystemParametersInfoW(SPI_SETMENUDROPALIGNMENT, TRUE, NULL, 0);
+        }
+
         DestroyMenu(hMenu);
         PostMessage(hwnd, WM_NULL, 0, 0);
       }
@@ -677,15 +747,92 @@ void CSoundKeeper::SetAutoStart(bool enable)
   RegCloseKey(hKey);
 }
 
+void CSoundKeeper::EnsureTrayIcon(bool forceReadd)
+{
+  if (!m_tray_hwnd)
+    return;
+
+  m_nid.hIcon = m_is_muted ? m_icon_muted : m_icon_normal;
+  wcscpy_s(m_nid.szTip, m_is_muted ? L"Sound Keeper - \u5DF2\u9759\u97F3" : L"Sound Keeper - \u64AD\u653E\u4E2D");
+  m_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+  m_nid.szInfo[0] = L'\0';
+  m_nid.szInfoTitle[0] = L'\0';
+
+  HWND hShellTray = FindWindowW(L"Shell_TrayWnd", NULL);
+  if (!hShellTray)
+  {
+    m_tray_icon_added = false;
+    m_last_shell_tray_hwnd = NULL;
+    m_tray_check_count = 0;
+    SetTimer(m_tray_hwnd, 1, 1000, NULL);
+    return;
+  }
+
+  if (!forceReadd && m_tray_icon_added && hShellTray == m_last_shell_tray_hwnd)
+  {
+    if (Shell_NotifyIconW(NIM_MODIFY, &m_nid))
+    {
+      if (m_tray_check_count < 10)
+      {
+        m_tray_check_count++;
+        if (m_tray_check_count >= 10)
+        {
+          SetTimer(m_tray_hwnd, 1, 30000, NULL);
+        }
+        else
+        {
+          SetTimer(m_tray_hwnd, 1, 3000, NULL);
+        }
+      }
+      return;
+    }
+    m_tray_icon_added = false;
+    m_tray_check_count = 0;
+  }
+
+  m_tray_check_count = 0;
+  Shell_NotifyIconW(NIM_DELETE, &m_nid);
+  if (Shell_NotifyIconW(NIM_ADD, &m_nid))
+  {
+    m_tray_icon_added = true;
+    m_last_shell_tray_hwnd = hShellTray;
+    SetTimer(m_tray_hwnd, 1, 3000, NULL);
+    DebugLog("Tray icon added successfully.");
+  }
+  else
+  {
+    m_tray_icon_added = false;
+    SetTimer(m_tray_hwnd, 1, 1000, NULL);
+    DebugLogWarning("Shell_NotifyIconW(NIM_ADD) failed, scheduled retry in 1s.");
+  }
+}
+
 bool CSoundKeeper::InitTrayIcon(HINSTANCE hInstance)
 {
+  s_msg_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+
+  // Enable dark mode and modern rounded menu styling via uxtheme.dll ordinals 135 & 136.
+  if (HMODULE hUxTheme = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32))
+  {
+    using fnSetPreferredAppMode = int(WINAPI *)(int);
+    using fnFlushMenuThemes = void(WINAPI *)();
+    if (auto pSetPreferredAppMode = (fnSetPreferredAppMode)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(135)))
+    {
+      pSetPreferredAppMode(2); // AllowDark
+    }
+    if (auto pFlushMenuThemes = (fnFlushMenuThemes)GetProcAddress(hUxTheme, MAKEINTRESOURCEA(136)))
+    {
+      pFlushMenuThemes();
+    }
+  }
+
   // Create icons.
   m_icon_normal = CreateSpeakerIcon(false);
   m_icon_muted = CreateSpeakerIcon(true);
 
   if (!m_icon_normal || !m_icon_muted)
   {
-    DebugLogError("Failed to create tray icons.");
+    DebugLogError("Failed to create tray icons. GetLastError=%u", GetLastError());
     return false;
   }
 
@@ -695,34 +842,38 @@ bool CSoundKeeper::InitTrayIcon(HINSTANCE hInstance)
   wc.lpfnWndProc = TrayWndProc;
   wc.hInstance = hInstance;
   wc.lpszClassName = L"SoundKeeperTrayClass";
-  if (!RegisterClassExW(&wc))
+  if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
   {
-    DebugLogError("Failed to register tray window class.");
+    DebugLogError("Failed to register tray window class. GetLastError=%u", GetLastError());
     return false;
   }
 
-  // Create hidden message-only window.
-  m_tray_hwnd = CreateWindowExW(0, L"SoundKeeperTrayClass", L"Sound Keeper", 0,
-                                0, 0, 0, 0, HWND_MESSAGE, NULL, hInstance, NULL);
+  // Create a hidden top-level window (NOT HWND_MESSAGE, which cannot receive TaskbarCreated broadcasts).
+  m_tray_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"SoundKeeperTrayClass", L"Sound Keeper", WS_POPUP,
+                                0, 0, 0, 0, NULL, NULL, hInstance, NULL);
   if (!m_tray_hwnd)
   {
-    DebugLogError("Failed to create tray message window.");
+    DebugLogError("Failed to create tray window. GetLastError=%u", GetLastError());
     return false;
+  }
+
+  if (s_msg_taskbar_created != 0)
+  {
+    ChangeWindowMessageFilterEx(m_tray_hwnd, s_msg_taskbar_created, MSGFLT_ALLOW, NULL);
   }
 
   // Store the this pointer for use in WndProc.
   SetWindowLongPtr(m_tray_hwnd, GWLP_USERDATA, (LONG_PTR)this);
 
-  // Set up tray icon.
+  // Set up tray icon structure and add it (with automatic retry if Explorer tray is not ready yet).
   m_nid = {};
   m_nid.cbSize = sizeof(NOTIFYICONDATAW);
   m_nid.hWnd = m_tray_hwnd;
   m_nid.uID = 1;
   m_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   m_nid.uCallbackMessage = WM_TRAYICON;
-  m_nid.hIcon = m_icon_normal;
-  wcscpy_s(m_nid.szTip, L"Sound Keeper - \u64AD\u653E\u4E2D");
-  Shell_NotifyIconW(NIM_ADD, &m_nid);
+
+  this->EnsureTrayIcon(true);
 
   DebugLog("Tray icon initialized.");
   return true;
@@ -730,7 +881,13 @@ bool CSoundKeeper::InitTrayIcon(HINSTANCE hInstance)
 
 void CSoundKeeper::RemoveTrayIcon()
 {
+  if (m_tray_hwnd)
+  {
+    KillTimer(m_tray_hwnd, 1);
+  }
+
   Shell_NotifyIconW(NIM_DELETE, &m_nid);
+  m_tray_icon_added = false;
 
   if (m_tray_hwnd)
   {
@@ -758,13 +915,19 @@ void CSoundKeeper::UpdateTrayIcon()
   wcscpy_s(m_nid.szTip, m_is_muted ? L"Sound Keeper - \u5DF2\u9759\u97F3" : L"Sound Keeper - \u64AD\u653E\u4E2D");
 
   // Show a balloon notification so the user knows the state changed.
-  m_nid.uFlags |= NIF_INFO;
+  m_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
   wcscpy_s(m_nid.szInfoTitle, L"Sound Keeper");
   wcscpy_s(m_nid.szInfo, m_is_muted ? L"\u5DF2\u9759\u97F3 \xD83D\xDD07" : L"\u64AD\u653E\u4E2D \xD83D\xDD0A");
   m_nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
   m_nid.uTimeout = 1500;
 
-  Shell_NotifyIconW(NIM_MODIFY, &m_nid);
+  if (!Shell_NotifyIconW(NIM_MODIFY, &m_nid))
+  {
+    m_tray_icon_added = false;
+    this->EnsureTrayIcon(true);
+    m_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &m_nid);
+  }
 
   // Clear the balloon flag so it doesn't re-show on future NIM_MODIFY calls.
   m_nid.uFlags &= ~NIF_INFO;
@@ -1077,9 +1240,9 @@ HRESULT CSoundKeeper::Run()
   {
     DebugLog("Stopping another instance...");
     SetEvent(global_stop_event);
-    bool is_timeout = WaitForOne(global_mutex, 1000) == WAIT_TIMEOUT;
+    DWORD wait_res = WaitForOne(global_mutex, 5000);
     ResetEvent(global_stop_event);
-    if (is_timeout)
+    if (wait_res != WAIT_OBJECT_0 && wait_res != WAIT_ABANDONED)
     {
       DebugLogError("Time out.");
       return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
@@ -1094,6 +1257,9 @@ HRESULT CSoundKeeper::Run()
     DebugLog("Self kill mode is enabled. Exit.");
     return hr;
   }
+
+  // Register for automatic restart if the process crashes unexpectedly.
+  RegisterApplicationRestart(NULL, 8 /* RESTART_NO_PATCH | RESTART_NO_REBOOT */);
 
   // Initialization.
 
@@ -1113,8 +1279,11 @@ HRESULT CSoundKeeper::Run()
   }
   defer[&] { m_dev_enumerator->UnregisterEndpointNotificationCallback(this); };
 
-  // Initialize tray icon (non-console mode only).
-#ifndef _CONSOLE
+  // Restore saved mute state.
+  m_is_muted = this->LoadMuteState();
+  DebugLog("Initial mute state: %s.", m_is_muted ? "Muted" : "Unmuted");
+
+  // Initialize tray icon.
   {
     HINSTANCE hInst = GetModuleHandle(NULL);
     if (!this->InitTrayIcon(hInst))
@@ -1123,7 +1292,6 @@ HRESULT CSoundKeeper::Run()
     }
   }
   defer[&] { this->RemoveTrayIcon(); };
-#endif
 
   // Working loop.
 
@@ -1131,6 +1299,24 @@ HRESULT CSoundKeeper::Run()
 
   for (bool working = true; working;)
   {
+    {
+      MSG msg;
+      while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+      {
+        if (msg.message == WM_QUIT)
+        {
+          working = false;
+          break;
+        }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+      }
+      if (!working)
+      {
+        break;
+      }
+    }
+
     uint32_t seconds_to_sleeping = (m_cfg_no_sleep ? -1 : GetSecondsToSleeping());
 
     if (m_is_muted)
@@ -1168,12 +1354,8 @@ HRESULT CSoundKeeper::Run()
     HANDLE wait_handles[] = {m_do_retry, m_do_restart, m_do_shutdown, global_stop_event};
     constexpr DWORD handle_count = 4;
 
-#ifndef _CONSOLE
-    // Use MsgWaitForMultipleObjects to also process window messages for the tray icon.
-    DWORD wait_result = MsgWaitForMultipleObjects(handle_count, wait_handles, FALSE, timeout, QS_ALLINPUT);
-#else
-    DWORD wait_result = WaitForAny({m_do_retry, m_do_restart, m_do_shutdown, global_stop_event}, timeout);
-#endif
+    // Use MsgWaitForMultipleObjectsEx with MWMO_INPUTAVAILABLE so unread messages never stall the wait.
+    DWORD wait_result = MsgWaitForMultipleObjectsEx(handle_count, wait_handles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 
     switch (wait_result)
     {
@@ -1212,7 +1394,6 @@ HRESULT CSoundKeeper::Run()
       working = false;
       break;
 
-#ifndef _CONSOLE
     case WAIT_OBJECT_0 + handle_count:
       // Process Windows messages for tray icon.
       {
@@ -1229,7 +1410,6 @@ HRESULT CSoundKeeper::Run()
         }
       }
       break;
-#endif
 
     default:
 
