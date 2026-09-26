@@ -8,13 +8,13 @@
 
 #define REV_MAJOR       1
 #define REV_MINOR       3
-#define REV_PATCH       5
-#define REV_EXTRA       1
-#define REV_BUILD       7
+#define REV_PATCH       6
+#define REV_EXTRA       0
+#define REV_BUILD       1
 
 #define REV_YEAR        2026
 #define REV_MONTH       9
-#define REV_DAY         25
-#define REV_DAY_BUILD   7
+#define REV_DAY         26
+#define REV_DAY_BUILD   1
 
 #endif // BUILDINFO_HPP
